@@ -1,5 +1,10 @@
 # AWS Service Kit
 
+<div align="center">
+    <img src="readme_resources/README.png" alt="AWS Utils" width="200"/>
+</div>
+
+
 ## Overview
 Utility modules to use for the AWS Service calls
 
