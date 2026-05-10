@@ -1,0 +1,5 @@
+boto3
+tenacity
+aws-secretsmanager-caching
+pytest
+pytest-mock
