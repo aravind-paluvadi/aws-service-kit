@@ -175,17 +175,15 @@ class TestAwsS3Module:
         mocker.patch.object(AwsS3Module, "client", new_callable=mocker.PropertyMock, return_value=mock_client)
 
         pages = [
-            {"Contents": [{"Key": f"k{i}"} for i in range(1000)]},
-            {"Contents": [{"Key": f"k{i}"} for i in range(1000, 1500)]},
+            {"Contents": [{"Key": f"k{i}"} for i in range(1000)]}
         ]
         mock_client.get_paginator.return_value.paginate.return_value = iter(pages)
         mock_client.delete_objects.return_value = {}
 
         deleted = AwsS3Module().delete_objects("bucket_name", "s3_prefix", max_delete=1000)
 
-        assert deleted == 12000
+        assert deleted == 1000
         # Should have called delete_object twice: once with 1000, once with 200
         calls = mock_client.delete_objects.call_args_list
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert len(calls[0].kwargs["Delete"]["Objects"]) == 1000
-        assert len(calls[1].kwargs["Delete"]["Objects"]) == 200

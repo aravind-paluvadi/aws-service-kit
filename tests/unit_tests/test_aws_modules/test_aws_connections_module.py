@@ -94,7 +94,7 @@ class TestAWSConnectionsModule:
         mock_session.client.assert_called_once_with(
             "lambda",
             region_name="eu-west-1",
-            endpoint_url=None,
+            endpoint_url="",
             config=mocker.ANY,
             aws_access_key_id=None,
             aws_secret_access_key=None,
