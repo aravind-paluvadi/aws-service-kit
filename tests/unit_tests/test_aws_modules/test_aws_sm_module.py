@@ -57,7 +57,7 @@ class TestAWSSMModule:
 
         secret = _get_cache("us-west-2")
         assert secret == "Mock Object"
-        mock_get_client.assert_called_once_with("secretsmanager", region="us-west-2")
+        mock_get_client.assert_called_once_with("secretsmanager", region_name="us-west-2")
         mock_config.assert_called_once_with(
             secret_refresh_interval=DEFAULT_DURATION_SECONDS,
             max_cache_size=MAX_SECRETS_PER_REGION

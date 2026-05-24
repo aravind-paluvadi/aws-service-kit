@@ -89,7 +89,7 @@ class TestAWSConnectionsModule:
         mocker.patch("aws_services.aws_modules.aws_connections_module.Session", return_value=mock_session)
         _CLIENT_CACHE.clear()
 
-        get_client("lambda", use_cache=False, region="eu-west-1")
+        get_client("lambda", use_cache=False, region_name="eu-west-1")
 
         mock_session.client.assert_called_once_with(
             "lambda",

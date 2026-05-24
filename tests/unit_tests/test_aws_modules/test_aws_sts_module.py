@@ -28,7 +28,7 @@ class TestAWSSTS:
 
     def test_get_endpoint_url_with_region(self):
         """Tests get_endpoint_url returns correct URL for a given region"""
-        assert get_endpoint_url(aws_region="us-west-2") == "https://sts.us-west-2.amazonaws.com"
+        assert get_endpoint_url(region_name="us-west-2") == "https://sts.us-west-2.amazonaws.com"
 
     def test_get_endpoint_url_default_region(self):
         """Tests get_endpoint_url falls back to detected region"""
@@ -39,7 +39,7 @@ class TestAWSSTS:
     def test_get_ednpoint_url_raises_on_invalid_region(self):
         """Tests get_ednpoint_url raises ValueError on invalid region"""
         with raises(ValueError):
-            get_endpoint_url(aws_region="INVALID_REGION")
+            get_endpoint_url(region_name="INVALID_REGION")
 
     # ---------------------- assume_role -------------------------------------
 
@@ -56,7 +56,7 @@ class TestAWSSTS:
 
         credentials = assume_role(role_arn=_VALID_ROLE_ARN)
         assert credentials["AccessKeyId"] == "AKIAIOSFODNN7EXAMPLE"
-        mock_get_client.assert_called_once_with("sts", endpoint_url=mocker.ANY ,region=DEFAULT_REGION)
+        mock_get_client.assert_called_once_with("sts", region_name=DEFAULT_REGION, endpoint_url=mocker.ANY)
 
     @mark.parametrize(
         "region", ["us-EAST-1", "us_east_1", "invalid"],
@@ -111,4 +111,4 @@ class TestAWSSTS:
 
         account_id = get_account_details()
         assert account_id == "123456789012"
-        mock_get_client.assert_called_once_with("sts", endpoint_url=mocker.ANY ,region=DEFAULT_REGION)
+        mock_get_client.assert_called_once_with("sts", region_name=DEFAULT_REGION, endpoint_url=mocker.ANY )

@@ -1,6 +1,11 @@
 """Helper module for project, contains utility functions"""
+from __future__ import annotations
+
 # Standard Library Imports
 import logging
+import hashlib
+from typing import Any
+from enum import StrEnum
 
 
 # PIP Imports
@@ -25,7 +30,7 @@ from .variables import (
 logger = logging.getLogger(__name__)
 
 
-def update_dict_keys(fields, mapping):
+def merge_known_kwargs(fields, overrides):
     """
     Update the keys of the fields dictionary based on the provided mapping. This allows for flexible renaming
     of fields while ensuring that only expected keys are updated.
@@ -33,24 +38,23 @@ def update_dict_keys(fields, mapping):
     ----------
         fields:
             The original dictionary containing the fields to be updated.
-        mapping:
+        overrides:
             A dictionary containing the fields are the original field name and values are the new fields names.
 
     Returns:
     -------
         A new dictionary with the updated fields based on the provided mapping.
     """
-    if mapping:
-        for key, value in mapping.items():
-            if key in fields:
-                fields[key] = value
-            # The key must exist in the available fields
-            else:
-                raise TypeError(f"Unexpected key {key} in mapping")
+    # Set the config options based on given values
+    if not overrides:
+        return dict(fields)
+    unknown = set(overrides) - set(fields)
+    if unknown:
+        raise TypeError(f"Unknown keyword arguments: {sorted(unknown)}")
+    return {**fields, **overrides}
 
-    return fields
 
-def require_non_empty(**fields):
+def require_non_empty(**fields: Any) -> None:
     """
     Check if the input fields are not empty.
     Parameters:
@@ -93,9 +97,39 @@ def aws_retryable(logger_instance: logging.Logger):
 
 def _is_retryable_error(exception: BaseException) -> bool:
     """Return True if exception is transient and should be retried."""
-    if isinstance(exception, (EndpointConnectionError, ConnectionClosedError)):
-        return True
-    if isinstance(exception, ClientError):
-        code = exception.response.get("Error", {}).get("Code", "")
-        return code in AWS_RETRYABLE_ERROR_CODES
-    return False
+    match exception:
+        case EndpointConnectionError() |  ConnectionClosedError():
+            return True
+        case ClientError():
+            code = exception.response.get("Error", {}).get("Code", "")
+            return code in None or code in AWS_RETRYABLE_ERROR_CODES
+        case _:
+            return False
+
+
+def _fp(*parts: str | None) -> str:
+    """
+    Function to hash the given parts using SHA-256 and return the hexadecimal digest.
+    This can be used to create unique identifiers for caching or other purposes.
+    """
+    h = hashlib.sha256()
+
+    for p in parts:
+        h.update((p or "").encode()); h.update(b"\0")
+    return h.hexdigest()
+
+
+class StorageClass(StrEnum):
+    STANDARD = "STANDARD"
+    STANDARD_IA = "STANDARD_IA"
+    ONEZONE_IA = "ONEZONE_IA"
+    GLACIER = "GLACIER"
+    GLACIER_IR = "GLACIER_IR"
+    DEEP_ARCHIVE = "DEEP_ARCHIVE"
+    INTELLIGENT_TIERING = "INTELLIGENT_TIERING"
+
+
+class RetryMode(StrEnum):
+    STANDARD = "standard"
+    ADAPTIVE = "adaptive"
+    LEGACY = "legacy"

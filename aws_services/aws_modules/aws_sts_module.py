@@ -1,13 +1,14 @@
 """File with AWS STS module"""
+from __future__ import annotations
+
 # Standard Library Imports
 import re
 import logging
 from time import time
-from typing import Tuple, Any, Optional
 
 
 # Local Imports
-from .aws_connections_module import get_client, get_region
+from .aws_connections_module import get_client, get_region, validate_region
 from aws_services.cache_manager.ttl_thread_cache_mager import TTLThreadCacheManager
 from aws_services.helper_utils.utils import aws_retryable
 from aws_services.helper_utils.variables import (
@@ -27,26 +28,26 @@ _STS_CACHE: TTLThreadCacheManager[dict] = TTLThreadCacheManager(early_refresh_se
 
 
 _ARN_PATTERN = re.compile(r"^arn:aws[-\w]*:iam::\d{12}:role/.+$")
-_REGION_PATTERN = re.compile(r"^[a-z]{2,}-[a-z]+-\d+$")
 
 
-def get_endpoint_url(aws_region: Optional[str] = None) -> str:
+def get_endpoint_url(region_name: str | None = None) -> str:
     """
     Get the STS endpoint URL for the specified AWS region.
     If no region is provided, it uses the default region.
 
     Parameter:
     ----------
-        aws_region:
+        region_name:
             AWS region for which to get the endpoint URL. Optional.
 
     Return:
     -------
         Endpoint URL for the STS service in the specified region.
     """
-    aws_region = aws_region or get_region()
-    if not _REGION_PATTERN.match(aws_region):
-        raise ValueError(f"Invalid AWS region provided: {aws_region!r}")
+    aws_region = region_name or get_region()
+
+    # Validate region format
+    validate_region(aws_region)
 
     return f"https://sts.{aws_region}.amazonaws.com"
 
@@ -55,10 +56,10 @@ def get_endpoint_url(aws_region: Optional[str] = None) -> str:
 def assume_role(
         role_arn: str,
         region_name: str = DEFAULT_REGION,
-        endpoint_url: Optional[str] = None,
+        endpoint_url: str | None = None,
         session_name: str = DEFAULT_SESSION_NAME,
         duration_seconds: int = DEFAULT_DURATION_SECONDS
-) -> dict:
+) -> dict | None:
     """
     Function to get credentials with specified endpoint
     Parameter:
@@ -81,15 +82,17 @@ def assume_role(
     if not role_arn or not _ARN_PATTERN.match(role_arn):
         raise ValueError(f"Invalid role_arn provided: {role_arn!r}")
 
-    resolved_endpoint = endpoint_url or get_endpoint_url(region_name)
-    cache_key = (role_arn, session_name, region_name)
+    # Validate region format
+    validate_region(region_name)
 
-    def aws_assume_role_call() -> Tuple[dict, Any]:
-        sts_client = get_client("sts", endpoint_url=resolved_endpoint, region=region_name)
+    resolved_endpoint = endpoint_url or get_endpoint_url(region_name)
+    cache_key = (role_arn, session_name, region_name, resolved_endpoint, duration_seconds)
+
+    def aws_assume_role_call() -> tuple[dict, float]:
+        sts_client = get_client("sts", region_name=region_name, endpoint_url=resolved_endpoint)
 
         logger.info(
-            "Assuming role",
-            extra={"role_arn": role_arn, "session_name": session_name, "region": region_name}
+            "Assuming role role_arn=%s session_name=%s region_name=%s", role_arn,  session_name,  region_name
         )
         assume_role_json = sts_client.assume_role(
             RoleArn=role_arn,
@@ -112,8 +115,8 @@ def assume_role(
 @aws_retryable(logger)
 def get_account_details(
         region_name: str = DEFAULT_REGION,
-        endpoint_url: Optional[str] = None
-) -> str:
+        endpoint_url: str | None = None
+) -> str | None:
     """
     Function to get account for the endpoint url
     Parameter:
@@ -127,15 +130,21 @@ def get_account_details(
     -------
         Account details of the current aws account.
     """
+    # Validate region format
+    validate_region(region_name)
+
     resolved_endpoint = endpoint_url or get_endpoint_url(region_name)
     cache_key = f"{region_name}:{endpoint_url}"
 
-    def aws_account_call() -> Tuple[str, float]:
-        sts_client = get_client("sts", endpoint_url=resolved_endpoint, region=region_name)
+    def aws_account_call() -> tuple[str, float]:
+        sts_client = get_client("sts", region_name=region_name, endpoint_url=resolved_endpoint)
         logger.info("Fetching caller identity", extra={"region": region_name})
 
         response = sts_client.get_caller_identity()
         account_id = response.get("Account")
+
+        if not account_id:
+            raise RuntimeError("Account ID not found in STS response")
 
         logger.info("Successfully retrieved account details", extra={"account_id": account_id})
         expires_at = time() + ACCOUNT_ID_EXPIRY_SECS

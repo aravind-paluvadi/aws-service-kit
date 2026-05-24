@@ -1,26 +1,27 @@
 """File for time to live (TTL) Thread Cache Manager"""
+from __future__ import annotations
+
 # Standard Library Imports
 import logging
 from time import time
-from typing import TypeVar, Callable, Optional, Any, Tuple
+from typing import Callable, Any, override
 
 
 # Local Imports
-from .base_cache_manager import BaseCacheManager, _MISSING
+from .base_cache_manager import _BaseCacheManager, _MISSING
 
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
 
 
-class TTLThreadCacheManager(BaseCacheManager[T]):
+class TTLThreadCacheManager[T](_BaseCacheManager[T]):
     """
     TTL Thread Cache Manager class with TTL expiry and early refresh window. Each cache entry is stored as a tuple
     of (value, expiry_time) and is considered valid if the current time is less than the expiry_time.
     - An optional early refresh window can be configured to trigger a background refresh before the actual expiry.
     """
 
-    def __init__(self, early_refresh_secs: int = 300, max_size: Optional[int] = None) -> None:
+    def __init__(self, early_refresh_secs: int = 300, max_size: int | None = None) -> None:
         """
         Initialize the TTL Thread Cache Manager with cache and lock.
         Parameters:
@@ -33,7 +34,8 @@ class TTLThreadCacheManager(BaseCacheManager[T]):
         super().__init__(max_size)
         self._early_refresh_secs = early_refresh_secs
 
-    def get(self, key: Any) -> Optional[T]:
+    @override
+    def get(self, key: Any) -> T | None:
         """
         Get the value for the given key if not expired, thread-safe read
         Parameter:
@@ -57,10 +59,10 @@ class TTLThreadCacheManager(BaseCacheManager[T]):
                 The expiry time of the entry
         """
         with self._lock:
-            self._evict_if_needed()
+            self._evict_if_needed(key)
             self._cache[key] = (value,expires_at)
 
-    def get_or_create_expiry(self, key: Any, factory: Callable[[], Tuple[T, float]]) -> Optional[T]:
+    def get_or_create_expiry(self, key: Any, factory: Callable[[], tuple[T, float]]) -> T | None:
         """
         Return cached value for the given key, or call factory to create a new one. factory() is called outside
         the lock to avoid blocking other threads
@@ -83,7 +85,7 @@ class TTLThreadCacheManager(BaseCacheManager[T]):
             factory=factory
         )
 
-    def _is_valid_entry(self, entry: Tuple[T, float]) -> bool:
+    def _is_valid_entry(self, entry: tuple[T, float]) -> bool:
         """
         Check if the given entry is valid, return true if the entry is still valid
         (Outside the early-refresh window).

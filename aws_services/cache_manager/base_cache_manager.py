@@ -1,18 +1,19 @@
 """File to handle the base cache manager"""
+from __future__ import annotations
+
 # Standard Library Imports
 import logging
 from threading import Lock, RLock
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import TypeVar, Callable, Generic, Optional, Any, Dict
+from typing import Callable, Any
 
 
 logger = logging.getLogger(__name__)
-T = TypeVar('T')
 _MISSING = object()
 
 
-class BaseCacheManager(ABC, Generic[T]):
+class _BaseCacheManager[T](ABC):
     """
     Base cache manager class to handle the shared infrastructure for thread-safe caches,
     Thread-safe cache manager that allows concurrent access to cached values using
@@ -20,7 +21,7 @@ class BaseCacheManager(ABC, Generic[T]):
     - Uses a per-key lock to prevent redundant factory() calls under concurrency.
     """
 
-    def __init__(self, max_size: Optional[int] = None) -> None:
+    def __init__(self, max_size: int | None = None) -> None:
         """
         Initialize the cache and lock in base cache manager
 
@@ -32,7 +33,7 @@ class BaseCacheManager(ABC, Generic[T]):
         """
         self._cache: OrderedDict[Any, Any] = OrderedDict()
         self._lock: RLock = RLock()
-        self._inflight: Dict[Any, Lock] = {}
+        self._inflight: dict[Any, Lock] = {}
         self._max_size = max_size
 
     def __len__(self) -> int:
@@ -41,7 +42,7 @@ class BaseCacheManager(ABC, Generic[T]):
             return len(self._cache)
 
     @abstractmethod
-    def get(self, key: Any) -> Optional[T]:
+    def get(self, key: Any) -> T | None:
         """
         Get the value for the given key, or None if not present
 
@@ -70,9 +71,19 @@ class BaseCacheManager(ABC, Generic[T]):
             self._cache.clear()
             self._inflight.clear()
 
-    def _evict_if_needed(self) -> None:
-        """Evict the least recently used (LRU) entry if max_sized exceed. Must be called under _lock"""
-        if self._max_size is not None and len(self._cache) >= self._max_size:
+    def _evict_if_needed(self, key_being_added: Any = _MISSING) -> None:
+        """
+        Evict the least recently used (LRU) entry if max_sized exceed. Must be called under _lock
+        Parameters:
+        ----------
+            key:
+                The key to look up in the cache
+        """
+        if (
+                self._max_size is not None
+                and len(self._cache) >= self._max_size
+                and key_being_added not in self._cache
+        ):
             lru_key = next(iter(self._cache))
             del self._cache[lru_key]
             logger.debug(f"Evicted LRU cache entry", extra= {"key": lru_key})
@@ -102,13 +113,11 @@ class BaseCacheManager(ABC, Generic[T]):
         -------
             The extracted value if the cache entry is valid, or _MISSING if not present or invalid
         """
-        if key in self._cache:
-            entry = self._cache[key]
-            if is_valid(entry):
-                self._cache.move_to_end(key)
-                if log_msg:
-                    logger.debug(log_msg, extra={"key": key})
-                return extract(entry)
+        if (entry := self._cache.get(key, _MISSING)) is not _MISSING and is_valid(entry):
+            self._cache.move_to_end(key)
+            if log_msg:
+                logger.debug(log_msg, extra={"key": key})
+            return extract(entry)
         return _MISSING
 
     def _get_or_create_impl(
@@ -164,20 +173,15 @@ class BaseCacheManager(ABC, Generic[T]):
             # -- Step 5: Slow path - call factory() OUTSIDE the global lock --
             # This is the expensive part (e.g., AWS calls, API calls). Running it outside _lock ensures
             # other keys are not blocked during this I/O operation.
-            try:
-                new_entry = factory()
-            except Exception:
-                # Clean up the per-key lock so future requests can retry
-                with self._lock:
-                    self._inflight.pop(key, None)
-                raise
+            new_entry = factory()
+
 
             # -- Step 6: Store result under gloabl lock and return --
             # Evict the oldet entry if max_size exceeded, store the new entry, and clean up the
             # per-key inflight lock (no longer needed).
             with self._lock:
-                self._evict_if_needed()
+                self._evict_if_needed(key)
                 self._cache[key] = new_entry
                 self._inflight.pop(key, None)
-                logger.debug("Cached new value", extra={"key": key})
+                logger.debug("Cached new value key=%r", key)
                 return extract(new_entry)
