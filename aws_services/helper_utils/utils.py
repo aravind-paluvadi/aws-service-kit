@@ -102,7 +102,7 @@ def _is_retryable_error(exception: BaseException) -> bool:
             return True
         case ClientError():
             code = exception.response.get("Error", {}).get("Code", "")
-            return code in None or code in AWS_RETRYABLE_ERROR_CODES
+            return code in AWS_RETRYABLE_ERROR_CODES
         case _:
             return False
 
