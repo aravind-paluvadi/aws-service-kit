@@ -1,23 +1,26 @@
 """File for Thread Cache Manager"""
+from __future__ import annotations
+
 # Standard Library Imports
 import logging
-from typing import TypeVar, Callable, Optional, Any
+from typing import Callable, Any, override
 
 # Local Imports
-from .base_cache_manager import BaseCacheManager
+from .base_cache_manager import _BaseCacheManager
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
 
 
-class ThreadCacheManager(BaseCacheManager[T]):
+
+class ThreadCacheManager[T](_BaseCacheManager[T]):
     """
     ThreadCacheManager is a thread-safe cache manager that allows concurrent
     access to cached values using double-checked locking pattern.
     Uses a per-key lock to prevent redundant factory() calls under concurrency.
     """
 
-    def get(self, key: Any) -> Optional[T]:
+    @override
+    def get(self, key: Any) -> T | None:
         """
         Get the value for the given key, thread-safe read
 
@@ -41,7 +44,7 @@ class ThreadCacheManager(BaseCacheManager[T]):
                 The value to set the key to
         """
         with self._lock:
-            self._evict_if_needed()
+            self._evict_if_needed(key)
             self._cache[key] = value
 
     def get_or_create(self, key: Any, factory: Callable[[], T]) -> T:

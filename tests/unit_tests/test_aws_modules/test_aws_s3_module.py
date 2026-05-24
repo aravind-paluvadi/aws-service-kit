@@ -3,6 +3,7 @@
 import pytest
 
 # Local Imports
+from aws_services.helper_utils.utils import StorageClass
 from aws_services.aws_modules.aws_s3_module import AwsS3Module, S3OperationError
 
 
@@ -33,7 +34,7 @@ class TestAwsS3Module:
             Key="path/to/file",
             Body=b"data",
             ContentType="application/octet-stream",
-            StorageClass="STANDARD"
+            StorageClass=StorageClass.STANDARD.value
         )
 
     def test_put_file_in_s3_raises_on_non_200(self, mocker):
@@ -167,3 +168,22 @@ class TestAwsS3Module:
         mocker.patch("aws_services.aws_modules.aws_s3_module.get_client", return_value=mock_put_s3)
 
         assert AwsS3Module().prefix_exists("bucket_name", "s3_prefix") == False
+
+    def test_delete_prefix_respects_max_delete(self, mocker):
+        """Test function to delete a prefix in the s3 path, returns 0 when no objects found"""
+        mock_client = mocker.MagicMock()
+        mocker.patch.object(AwsS3Module, "client", new_callable=mocker.PropertyMock, return_value=mock_client)
+
+        pages = [
+            {"Contents": [{"Key": f"k{i}"} for i in range(1000)]}
+        ]
+        mock_client.get_paginator.return_value.paginate.return_value = iter(pages)
+        mock_client.delete_objects.return_value = {}
+
+        deleted = AwsS3Module().delete_objects("bucket_name", "s3_prefix", max_delete=1000)
+
+        assert deleted == 1000
+        # Should have called delete_object twice: once with 1000, once with 200
+        calls = mock_client.delete_objects.call_args_list
+        assert len(calls) == 1
+        assert len(calls[0].kwargs["Delete"]["Objects"]) == 1000

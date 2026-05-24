@@ -1,8 +1,10 @@
 """File with AWS Secrets Manager module"""
+from __future__ import annotations
+
 # Standard Library Imports
 import logging
 from json import loads, JSONDecodeError
-from typing import Dict, Any, Union
+from typing import Any
 
 
 # PIP Imports
@@ -11,12 +13,12 @@ from aws_secretsmanager_caching import SecretCache, SecretCacheConfig
 
 
 # Local Imports
-from .aws_connections_module import get_client
+from .aws_connections_module import get_client, validate_region
 from aws_services.cache_manager.thread_cache_manager import ThreadCacheManager
 from aws_services.helper_utils.utils import aws_retryable, require_non_empty
 from aws_services.helper_utils.variables import (
     DEFAULT_REGION, DEFAULT_DURATION_SECONDS, MAX_REGION_CACHES,
-    MAX_SECRETS_PER_REGION, AWS_RETRYABLE_ERROR_CODES
+    MAX_SECRETS_PER_REGION
 )
 
 
@@ -32,7 +34,7 @@ _CACHE_BY_REGION: ThreadCacheManager = ThreadCacheManager(max_size=MAX_REGION_CA
 
 def _get_cache(region_name: str, ttl: int = DEFAULT_DURATION_SECONDS) -> SecretCache:
     """
-    Get or create a SecretCache for the specified region.
+    Get or create a SecretCache for the specified region. TTL is fixed per region.
     Parameter:
     ---------
         region_name:
@@ -43,9 +45,12 @@ def _get_cache(region_name: str, ttl: int = DEFAULT_DURATION_SECONDS) -> SecretC
     -------
         SecretCache instance for the specified region.
     """
+    # Validate region format
+    validate_region(region_name)
+
     cache_key = (region_name, ttl)
     def sm_call() -> SecretCache:
-        sm_client = get_client("secretsmanager", region=region_name)
+        sm_client = get_client("secretsmanager", region_name=region_name)
         config = SecretCacheConfig(
             secret_refresh_interval=ttl,
             max_cache_size=MAX_SECRETS_PER_REGION
@@ -60,7 +65,7 @@ def get_secret(
         secret_name: str,
         region_name: str = DEFAULT_REGION,
         ttl: int = DEFAULT_DURATION_SECONDS
-) -> Union[Dict[str, Any], str]:
+) -> dict[str, Any] | str:
     """
     Function to get secrets with specified secret name
     Parameter:
@@ -93,13 +98,12 @@ def get_secret(
     try:
         secret_str = _get_cache(region_name, ttl).get_secret_string(secret_name)
     except ClientError as error_msg:
-        code = error_msg.response['Error']['Code']
-        if code not in AWS_RETRYABLE_ERROR_CODES:
-            logger.error(
-                "Non-retryable Secrets Manager error",
-                extra={"secret_name": secret_name, "error_code": code}
-            )
+        code = error_msg.response.get('Error', {}).get('Code', '')
+        logger.error("Secrets Manager error code=%s secret=%s",code, secret_name)
         raise
+
+    if secret_str is None:
+        raise ValueError(f"Secret {secret_name!r} has no secret string (binary-only?)")
 
     try:
         return loads(secret_str)

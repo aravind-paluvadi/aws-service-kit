@@ -9,8 +9,8 @@ EXAMPLE:
 This promotes cleaner and more convenient imports for users of the package.
 """
 # cache_manager/__init__.py
-from .base_cache_manager import BaseCacheManager
 from .thread_cache_manager import ThreadCacheManager
 from .ttl_thread_cache_mager import TTLThreadCacheManager
 
-__all__ = ['BaseCacheManager', 'ThreadCacheManager', 'TTLThreadCacheManager']
+
+__all__ = ['ThreadCacheManager', 'TTLThreadCacheManager']

@@ -1,8 +1,10 @@
 """File to handle the AWS Session calls"""
+from __future__ import annotations
+
 # Standard Library Imports
-import logging
+import logging, re
 from functools import lru_cache
-from typing import Optional, Callable, Any
+from typing import Callable, Any
 
 
 # Pip Imports
@@ -16,25 +18,28 @@ from botocore.exceptions import (
 
 # Local Imports
 from aws_services.cache_manager.thread_cache_manager import ThreadCacheManager
-from aws_services.helper_utils.variables import DEFAULT_REGION, MAX_CACHE_SIZE
-from aws_services.helper_utils.utils import update_dict_keys, aws_retryable
+from aws_services.helper_utils.utils import merge_known_kwargs, aws_retryable, _fp
+from aws_services.helper_utils.variables import DEFAULT_REGION, MAX_CACHE_SIZE, CLIENT_OPTIONS_DEFAULT
 
 
-__all__ = ["get_client", "get_region"]
+__all__ = ["get_client", "get_region", "validate_region"]
 
 logger = logging.getLogger(__name__)
 
 _CLIENT_CACHE: ThreadCacheManager = ThreadCacheManager(max_size=MAX_CACHE_SIZE)
+_REGION_PATTERN = re.compile(r"^[a-z]{2,}-[a-z]+-\d+$")
 
-_OPTIONS_DEFAULT = {
-    "region": DEFAULT_REGION,
-    "endpoint_url": None,
-    "max_attempts": 10,
-    "config_mode": "standard",
-    "connect_timeout": 10,
-    "read_timeout": 120,
-    "max_pool_connections": 50
-}
+
+def validate_region(region_name: str) -> None:
+    """
+    Validate the AWS region name
+    Parameters:
+    ----------
+        region_name:
+            AWS region name (e.g. 'us-east-1'). If not provided, will use default from session or fallback.
+    """
+    if not _REGION_PATTERN.match(region_name):
+        raise ValueError(f"Invalid AWS region provided: {region_name!r}")
 
 
 @lru_cache(maxsize=1)
@@ -59,10 +64,12 @@ def get_region() -> str:
 
 def get_client(
         service_name: str,
-        config: Optional[Config] = None,
-        aws_access_key_id: Optional[str] = None,
-        aws_secret_access_key: Optional[str] = None,
-        aws_session_token: Optional[str] = None,
+        region_name: str = DEFAULT_REGION,
+        endpoint_url: str = "",
+        config: Config | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
         use_cache: bool = True,
         **kwargs: Any
 ) -> Any:
@@ -74,7 +81,7 @@ def get_client(
     ----------
         service_name:
             AWS service name (e.g. 'sts', 'secretsmanager')
-        region:
+        region_name:
             AWS region name (e.g. 'us-east-1'). If not provided, will use default from session or fallback.
         endpoint_url:
             Custom endpoint URL for the service (useful for testing or non-AWS environments)
@@ -83,7 +90,7 @@ def get_client(
             a default config with retries will be used.
         max_attempts:
             Maximum Botocore retry attempts for AWS API calls (default: 10)
-        config_mode:
+        retry_mode:
             Botocore retry mode (e.g. 'standard' or 'adaptive' for client-side rate limiting)
         connect_timeout:
             Connection timeout in seconds for AWS API calls (default: 10)
@@ -105,26 +112,33 @@ def get_client(
     -------
         boto3 client for the specified service
     """
-    options = _OPTIONS_DEFAULT.copy()
-    args = update_dict_keys(options, kwargs)
+    # Validate region format
+    validate_region(region_name)
+
+    options = dict(CLIENT_OPTIONS_DEFAULT)
+
+    try:
+        args = merge_known_kwargs(options, kwargs)
+    except TypeError as err_msg:
+        raise TypeError(f"Missing keys in get_client function: {err_msg}") from err_msg
 
     # Never cache client with explicit session credentials (tokens expire)
     should_cache = use_cache and not aws_session_token
     cache_key = (
         service_name,
-        args.get("region"),
-        args.get("endpoint_url"),
-        args.get("max_attempts"),
-        args.get("config_mode"),
-        args.get("connect_timeout"),
-        args.get("read_timeout"),
-        args.get("max_pool_connections"),
-        aws_access_key_id
+        region_name,
+        endpoint_url,
+        args["max_attempts"],
+        args["retry_mode"],
+        args["connect_timeout"],
+        args["read_timeout"],
+        args["max_pool_connections"],
+        _fp(aws_access_key_id, aws_secret_access_key),
     ) if should_cache else None
 
     cfg = config or _build_config(
         max_attempts=args.get("max_attempts"),
-        retry_mode=args.get("config_mode"),
+        retry_mode=args.get("retry_mode"),
         connect_timeout=args.get("connect_timeout"),
         read_timeout=args.get("read_timeout"),
         max_pool_connections=args.get("max_pool_connections")
@@ -133,15 +147,15 @@ def get_client(
     def _create() -> Any:
         return Session().client(
             service_name,
-            region_name=args.get("region"),
-            endpoint_url=args.get("endpoint_url"),
+            region_name=region_name,
+            endpoint_url=endpoint_url,
             config=cfg,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token
         )
 
-    if cache_key:
+    if cache_key is not None:
         return _CLIENT_CACHE.get_or_create(
             cache_key,
             lambda: _create_client_with_retry(_create, service_name)
@@ -150,13 +164,7 @@ def get_client(
     return _create_client_with_retry(_create, service_name)
 
 
-def _build_config(
-        max_attempts: int = 10,
-        retry_mode: str = "standard",   # or 'adaptive' for client-side rate limiting
-        connect_timeout: int = 10,
-        read_timeout: int = 120,
-        max_pool_connections: int = 50    # increase for concurrency
-) -> Config:
+def _build_config(**overrides) -> Config:
     """
     Function to build the config.
 
@@ -177,16 +185,17 @@ def _build_config(
     -------
         Config object with specified retry and timeout settings
     """
+    opts = {**CLIENT_OPTIONS_DEFAULT, **overrides}
     return Config(
-        retries={"max_attempts": max_attempts, "mode": retry_mode},
-        connect_timeout=connect_timeout,
-        read_timeout=read_timeout,
-        max_pool_connections=max_pool_connections
+        retries={"max_attempts": opts["max_attempts"], "mode": opts["retry_mode"]},
+        connect_timeout=opts["connect_timeout"],
+        read_timeout=opts["read_timeout"],
+        max_pool_connections=opts["max_pool_connections"]
     )
 
 
 @aws_retryable(logger)
-def _create_client_with_retry(create_fn: Callable, service_name: str) -> Any:
+def _create_client_with_retry(create_fn: Callable[[], Any], service_name: str) -> Any:
     """
     Parameters:
     ----------
