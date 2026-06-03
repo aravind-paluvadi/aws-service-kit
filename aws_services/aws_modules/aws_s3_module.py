@@ -178,10 +178,8 @@ class AwsS3Module:
 
         status_code = response["ResponseMetadata"]["HTTPStatusCode"]
         if status_code >= 300:
-            raise S3OperationError(
-                f"put_object to s3://%s%s is %s", bucket_name, s3_file_path, status_code
-            )
-        logger.info(f"Status of the files written to s3://%s/%s is %s", bucket_name, s3_file_path, status_code)
+            raise S3OperationError(f"put_object to s3://{bucket_name}{s3_file_path} is {status_code}")
+        logger.info("Status of the files written to s3://%s/%s is %s", bucket_name, s3_file_path, status_code)
 
 
     # ----------------------------- List / Query ----------------------------------------------------------
