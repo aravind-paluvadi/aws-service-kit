@@ -4,7 +4,10 @@ from __future__ import annotations
 # Standard Library Imports
 import logging, io
 from threading import Lock
-from typing import IO, Iterator, Any
+from typing import IO, Iterator, BinaryIO, Any
+
+# PIP Imports
+from boto3.s3.transfer import TransferConfig
 
 # Local Imports
 from .aws_connections_module import get_client
@@ -106,7 +109,7 @@ class AwsS3Module:
         logger.info("Reading s3://%s/%s", bucket_name, s3_file_path)
         obj = self.client.get_object(Bucket=bucket_name, Key=s3_file_path)
         if max_bytes is not None:
-            size = int(obj.get("ContentLength", 0))
+            size = int(obj["ContentLength"]) if "ContentLength" in obj else 0
             if size > max_bytes:
                 raise S3OperationError(f"Object s3://{bucket_name}/{s3_file_path} is {size} bytes, exceeds max_bytes={max_bytes}")
 
@@ -181,6 +184,148 @@ class AwsS3Module:
             raise S3OperationError(f"put_object to s3://{bucket_name}{s3_file_path} is {status_code}")
         logger.info("Status of the files written to s3://%s/%s is %s", bucket_name, s3_file_path, status_code)
 
+    # ------------------------ Write ---------------------------------------------
+
+    @aws_retryable(logger)
+    def upload_file_to_s3(
+            self,
+            file_obj: BinaryIO,
+            bucket_name: str,
+            s3_file_path: str,
+            config: bool = False,
+            kms_key_id: str | None = None,
+            multipart_threshold: int = 100 * 1024 * 1024, # 100 MB
+            multipart_chunksize: int = 20 * 1024 * 1024, # 100 MB chunks
+            max_concurrency: int = 10, # parallel threads
+            use_threads: bool = True
+    ) -> None:
+        """
+        Function to upload a file-like object to S3 with optional KMS encryption and multipart upload support.
+        Notes:
+            - Requires a seekable stream so retries can restart from byte 0.
+            - Uses multipart config only when `config=True`.
+
+        Parameters:
+            file_obj:
+                A file-like object (e.g. io.BytesIO, open file handle) containing the data to upload.
+            bucket_name:
+                The name of the S3 bucket.
+            s3_file_path:
+                The path to the file in the S3 bucket (e.g. "folder/subfolder/file.csv").
+            config:
+                Whether to use transfer configuration for multipart upload. Default is False.
+            kms_key_id:
+                The KMS key ID for server-side encryption.
+            multipart_threshold:
+                Threshold for multipart upload in bytes. Files larger than this will be uploaded in parts. Default
+                is 100 MB.
+            multipart_chunksize:
+                Size of each part in bytes when performing multipart upload. Default is 100 MB.
+            max_concurrency:
+                The maximum number of concurrent multipart uploads. Default is 10.
+            use_threads:
+                Whether to use threads for multipart uploads. Default is True.
+        """
+        if not hasattr(file_obj, "seek") or not hasattr(file_obj, "read"):
+            raise TypeError("file_obj must be a file-like object with read() and seek() methods")
+
+        # Safe retries require rewinding to start
+        try:
+            file_obj.seek(0)
+        except Exception as err_msg:
+            raise ValueError("upload_object requires a seekable stream for safe retries") from err_msg
+
+        logger.info("Uploading file to s3://%s/%s", bucket_name, s3_file_path)
+        upload_kwargs = AwsS3Module._build_transfer_kwargs(
+            config,
+            multipart_threshold,
+            multipart_chunksize,
+            max_concurrency,
+            use_threads,
+            kms_key_id,
+            allow_extra_args=True
+        )
+
+        self.client.upload_file_obj(
+            file_obj,
+            bucket_name,
+            s3_file_path,
+            **upload_kwargs
+        )
+        logger.info("Successfully uploaded file to s3://%s/%s", bucket_name, s3_file_path)
+
+    # ----------------------------- Copy File ----------------------------------------------------------
+    @aws_retryable(logger)
+    def copy_file_to_s3(
+            self,
+            source_bucket: str,
+            source_key: str,
+            source_client: AwsS3Module,
+            destination_bucket: str,
+            destination_key: str,
+            config: bool = False,
+            kms_key_id: str | None = None,
+            multipart_threshold: int = 100 * 1024 * 1024,  # 100 MB
+            multipart_chunksize: int = 20 * 1024 * 1024,  # 100 MB chunks
+            max_concurrency: int = 10,  # parallel threads
+            use_threads: bool = True
+    ) -> bool:
+        """
+        Copy an s3 object into another s3 bucket and location.
+
+        Parameters:
+        ----------
+            source_bucket:
+                The name of the Source S3 bucket.
+            source_key:
+                The Source bucket key of the object to copy.
+            source_client:
+                The S3 client for the source bucket.
+            destination_bucket:
+                The name of the destination S3 bucket.
+            destination_key:
+                The key of the object in the destination bucket.
+            config:
+                Whether to use transfer config.
+            kms_key_id:
+                The KMS key ID for server-side encryption.
+            multipart_threshold:
+                Size threshold for multipart uploads.
+            multipart_chunksize:
+                Size of each part in bytes when performing multipart upload.
+            max_concurrency:
+                The maximum number of concurrent multipart uploads.
+            use_threads:
+                Whether to use threads for multipart uploads.
+
+        Returns:
+        -------
+            A boolean true if the copy is successful, raises error otherwise.
+        """
+        logger.info(
+            "Starting copy file: s3://%s/%s -> s3://%s/%s",
+            source_bucket, source_key, destination_bucket, destination_key
+        )
+        copy_kwargs = AwsS3Module._build_transfer_kwargs(
+            config,
+            multipart_threshold,
+            multipart_chunksize,
+            max_concurrency,
+            use_threads,
+            kms_key_id,
+            allow_extra_args=True
+        )
+
+        copy_source = {"Bucket": source_bucket, "Key": source_key}
+        self.client.copy(
+            CopySource=copy_source,
+            Bucket=destination_bucket,
+            Key=destination_key,
+            **copy_kwargs,
+            SourceClient=source_client
+        )
+        logger.info("Successfully copied file to s3://%s/%s", destination_bucket, destination_key)
+        return True
 
     # ----------------------------- List / Query ----------------------------------------------------------
 
@@ -309,6 +454,85 @@ class AwsS3Module:
         logger.info("Deleted %d objects under s3://%s/%s", deleted_count, bucket_name, prefix)
         return deleted_count
 
+    # ------------------------------- Delete -------------------------------------------------
+    @aws_retryable(logger)
+    def download_object_from_s3(
+            self,
+            bucket_name: str,
+            s3_file_path: str,
+            file_obj: BinaryIO | None = None,
+            config: bool = False,
+            multipart_threshold: int = 100 * 1024 * 1024,  # 100 MB
+            multipart_chunksize: int = 20 * 1024 * 1024,  # 100 MB chunks
+            max_concurrency: int = 10,  # parallel threads
+            use_threads: bool = True,
+            max_bytes: int | None = None,
+    ) -> io.BytesIO | None:
+        """
+        Download an S3 object to a file-like object with optional multipart download support and memory guard.
+
+        Parameters:
+        -----------
+        bucket_name:
+            Name of the S3 bucket
+        s3_file_path:
+            Path to the file in the S3 bucket (key)
+        file_obj:
+            A file-like object (e.g. io.BytesIO, open file handle) to write
+            the downloaded data to. If not provided, a new io.BytesIO() will be used and returned.
+        config:
+            Whether to use transfer configuration for multipart download. Default is False.
+        multipart_threshold:
+            Threshold for multipart download in bytes. Files larger than this will be downloaded in parts. Default
+            is 100 MB.
+        multipart_chunksize:
+            Size of each part in bytes when performing multipart download. Default is 100 MB.
+        max_concurrency:
+            The maximum number of concurrent multipart downloads. Default is 10.
+        use_threads:
+            Whether to use threads for multipart downloads. Default is True.
+        max_bytes:
+            Optional maximum number of bytes to read from the object.
+            If provided, a head_object call will be made to check the content length before downloading,
+            and an error will be raised if the object size exceeds max_bytes.
+            This is useful as a memory guard to avoid downloading large objects when only a preview is needed.
+        """
+        logger.info("Downloading object from s3://%s/%s", bucket_name, s3_file_path)
+
+        # Optional memory guard before allocating/streaming full content.
+        if max_bytes is not None:
+            head  = self.client.head_object(Bucket=bucket_name, Key=s3_file_path)
+            content_length = int(head.get("ContentLength", 0))
+            if content_length > max_bytes:
+                raise S3OperationError(
+                    f"Object size {content_length} exceeds {max_bytes} bytes, aborting"
+                )
+
+        download_kwargs = AwsS3Module._build_transfer_kwargs(
+            config,
+            multipart_threshold,
+            multipart_chunksize,
+            max_concurrency,
+            use_threads,
+            kms_key_id=None,
+            allow_extra_args=False
+        )
+
+        buffer = file_obj if file_obj is not None else io.BytesIO()
+        if hasattr(buffer, "seek"):
+            buffer.seek(0)
+        if hasattr(buffer, "truncate"):
+            buffer.truncate(0)
+        self.client.download_fileobj(
+            bucket_name, s3_file_path, buffer, **download_kwargs
+        )
+
+        if file_obj is not None:
+            buffer.seek(0)
+            return buffer
+
+        logger.info("Downloaded object from s3://%s/%s", bucket_name, s3_file_path)
+        return None
     # --------------------------------------- Utility ----------------------------------------
     @aws_retryable(logger)
     def prefix_exists(self, bucket_name: str, prefix: str) -> bool:
@@ -358,3 +582,51 @@ class AwsS3Module:
             for obj in page.get("Contents", []):
                 if (key := obj["Key"]) and (suffix is None or key.endswith(suffix)):
                     yield key
+
+    @staticmethod
+    def _build_transfer_kwargs(
+            use_config: bool,
+            multipart_threshold: int,
+            multipart_chunksize: int,
+            max_concurrency: int,
+            use_threads: bool,
+            kms_key_id: str | None = None,
+            allow_extra_args: bool = True
+    ) -> dict[str, Any]:
+        """
+        Transfer kwargs specific to AWS S3
+        Parameters:
+        ----------
+            use_config:
+                Whether to include the TransferConfig in the kwargs.
+            multipart_threshold:
+                 The size threshold for multipart uploads.
+            multipart_chunksize:
+                The chunk size for multipart uploads.
+            max_concurrency:
+                The maximum number of threads for multipart uploads.
+            use_threads:
+                Whether to use threads for multipart uploads.
+            kms_key_id:
+                Optional KMS key ID for server-side encryption. If provided, ExtraArgs will include the KMS settings.
+            allow_extra_args:
+                Whether to include ExtraArgs in the kwargs if kms_key_id is provided.
+        Return:
+        -------
+            dict[str, Any]: Dictionary of transfer kwargs for S3 operations.
+        """
+        kwargs: dict[str, Any] = {}
+        if use_config:
+            kwargs["Config"] = TransferConfig(
+                multipart_threshold=multipart_threshold,
+                multipart_chunksize=multipart_chunksize,
+                max_concurrency=max_concurrency,
+                use_threads=use_threads
+            )
+
+        if allow_extra_args and kms_key_id:
+            kwargs["ExtraArgs"] = {
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": kms_key_id
+            }
+        return kwargs
