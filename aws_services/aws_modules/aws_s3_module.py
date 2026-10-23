@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 # Standard Library Imports
-import logging, io
+import logging, io, os
 from threading import Lock
+from datetime import datetime, timezone
 from typing import IO, Iterator, BinaryIO, Any
 
 # PIP Imports
 from boto3.s3.transfer import TransferConfig
+from botocore.exceptions import ClientError, NoCredentialsError
 
 # Local Imports
 from .aws_connections_module import get_client
@@ -206,6 +208,7 @@ class AwsS3Module:
             - Uses multipart config only when `config=True`.
 
         Parameters:
+        ----------
             file_obj:
                 A file-like object (e.g. io.BytesIO, open file handle) containing the data to upload.
             bucket_name:
@@ -253,6 +256,223 @@ class AwsS3Module:
             **upload_kwargs
         )
         logger.info("Successfully uploaded file to s3://%s/%s", bucket_name, s3_file_path)
+
+    @staticmethod
+    def _estimated_parts(file_size_bytes: int, part_size_bytes: int) -> int:
+        """
+        Parameters:
+        ----------
+            file_size_bytes:
+                Size of the file in bytes.
+            part_size_bytes:
+                Size of each part in bytes.
+        Returns:
+        --------
+            Estimated number of parts for multipart upload.
+        """
+        if file_size_bytes < 0:
+            raise ValueError(f"file_size_bytes must be >= 0, got {file_size_bytes}")
+        if part_size_bytes <= 0:
+            raise ValueError(f"part_size_bytes must be > 0, got {part_size_bytes}")
+
+        return -(-file_size_bytes // part_size_bytes) # ceiling division
+
+    def abort_incomplete_multipart_uploads(
+            self,
+            bucket_name: str,
+            key: str,
+            min_age_seconds: int = 900, # 15-min safety window
+            exact_key: bool = True
+    ) -> int:
+        """
+        Aborts all incomplete multipart uploads matching the given key prefix in the S3 bucket.
+        This is useful for cleaning up resources and avoiding unnecessary storage costs.
+        Parameters:
+        ----------
+            bucket_name:
+                The name of the S3 bucket.
+            key:
+                The key to match incomplete multipart uploads.
+            min_age_seconds:
+                The minimum age of incomplete multipart uploads to abort (defaults to 900 seconds).
+            exact_key:
+                If True, only abort uploads that exactly match the key. If False,
+                abort any uploads that start with the key.
+        Returns:
+        -------
+            The number of aborted multipart uploads.
+        """
+        if min_age_seconds < 0:
+            raise ValueError(f"min_age_seconds must be >= 0, got {min_age_seconds}")
+
+        paginator = self.client.get_paginator("list_multipart_uploads")
+        aborted_count = 0
+        now = datetime.now(timezone.utc)
+
+        try:
+            for page in paginator.paginate(Bucket=bucket_name, Prefix=key):
+                for upload in page.get("Uploads", []):
+                    upload_key = upload.get("Key", "")
+                    initiated = upload.get("Initiated")
+
+                    if exact_key and upload_key != key:
+                        continue
+
+                    # Only abort old uploads to avoid killing active writers
+                    if initiated is not None:
+                        age_seconds = (now - initiated).total_seconds()
+                        if age_seconds < min_age_seconds:
+                            continue
+
+                    try:
+                        self.client.abort_multipart_upload(
+                            Bucket=bucket_name,
+                            Key=upload_key,
+                            UploadId=upload.get('UploadId')
+                        )
+                        logger.warning(
+                            f"Aborted orphaned multipart upload for key: {upload_key} uploaded Id = {upload.get('UploadId')}"
+                        )
+                        aborted_count += 1
+                    except ClientError as error_msg:
+                        logger.error(
+                            f"Failed to abort upload Key = {upload_key} uploaded Id = {upload.get('UploadId')}: {error_msg}"
+                        )
+                        continue
+
+        except ClientError as error_msg:
+            logger.error(f"Failed to clean multipart uploads for bucket {bucket_name} with prefix {key}: {error_msg}")
+
+        if aborted_count:
+            logger.info("Cleaned up %d incomplete multipart uploads.", aborted_count)
+        return aborted_count
+
+    @aws_retryable(logger)
+    def upload_file(
+            self,
+            file_path: str,
+            bucket_name: str,
+            s3_file_path: str | None = None,
+            config: bool = False,
+            kms_key_id: str | None = None,
+            multipart_threshold: int = 100 * 1024 * 1024,
+            multipart_chunksize: int = 100 * 1024 * 1024,
+            max_concurrency: int = 10,
+            cleanup_orphans: bool = True,
+            cleanup_on_failure: bool = False,
+            use_threads: bool = True
+    ) -> bool:
+        """
+        Upload a local file to S3 with optional multipart upload and cleanup of orphaned uploads.
+        Parameters:
+        ----------
+            file_path:
+                Absolute path to the local file to upload.
+            bucket_name:
+                The name of the target S3 bucket.
+            s3_file_path:
+                Destination path in the S3 bucket. If None, the file name from file_path will be used.
+            config:
+                Whether to use TransferConfig for multipart upload configuration. Default is False.
+            kms_key_id:
+                Optional KMS key ID or ARN for the server side encryption.
+            multipart_threshold:
+                Threshold for multipart upload in bytes. Files larger than this will be uploaded in parts.
+                Default is 100 MB.
+            multipart_chunksize:
+                Chunk size (in bytes) for each part in a multipart upload. Default is 100 MB.
+            max_concurrency:
+                Max number of threads to use for multipart uploads. Default is 10.
+            cleanup_orphans:
+                Abort any pre-existing incomplete uploads for this key. Default is True.
+            cleanup_on_failure:
+                If True, attempts stale multipart cleanup after a failed upload.
+                Note: This may abort other uploads on the same key that are older than min_age_seconds.
+                Default is False for safety.
+            use_threads:
+                Whether to use threads for uploading. Default is True.
+
+        Returns:
+        -------
+            True if the upload was successful, False otherwise.
+        """
+        if s3_file_path is None:
+            s3_file_path = os.path.basename(file_path)
+
+        if not os.path.isfile(file_path):
+            logger.error(f"File {file_path} does not exist.")
+            return False
+
+        file_size = os.path.getsize(file_path)
+        estimated_parts = None
+
+        if config:
+            if multipart_chunksize < 5 * 1024 * 1024:
+                logger.error("multipart_chunksize must be >= 5 MiB when")
+                return False
+
+            try:
+                estimated_parts = AwsS3Module._estimated_parts(file_size, multipart_threshold)
+            except ValueError as exc:
+                logger.error("Invalid multipart chunk configuration: %s", exc)
+                return False
+
+            # Guard: S3 hard limit is 10,000 parts
+            if estimated_parts > 10_000:
+                logger.error(
+                    "File too large for chunk size: %d parts estimated, S3 limit is 10,000."
+                    " Increase multipart_chunksize.", estimated_parts
+                )
+                return False
+
+        logger.info(f"File: {file_path} ({file_size / (1024 ** 3 ):.2f} GB)")
+        logger.info(f"Upload file under target s3://{bucket_name}/{s3_file_path}")
+        chunk_mb = multipart_chunksize / (1024 * 1024)
+        logger.info("Config: chunk=%d bytes (%.2f MiB), concurrency=%d, parts~%s",
+                    multipart_chunksize, chunk_mb, max_concurrency, estimated_parts
+        )
+
+        upload_kwargs = AwsS3Module._build_transfer_kwargs(
+            config,
+            multipart_threshold,
+            multipart_chunksize,
+            max_concurrency,
+            use_threads,
+            kms_key_id,
+            allow_extra_args=True
+        )
+
+        # Clean up any orphaned incomplete uploads for this key before starting
+        if cleanup_orphans:
+            self.abort_incomplete_multipart_uploads(bucket_name, s3_file_path, min_age_seconds=900, exact_key=True)
+
+        try:
+            self.client.upload_file(file_path, bucket_name, s3_file_path, **upload_kwargs)
+        except NoCredentialsError as error_msg:
+            logger.error(
+                "AWS credentials not found. Configure via environment variables, "
+                "AWS CLI, or IAM role. Error: %s", error_msg
+            )
+            if cleanup_on_failure:
+                logger.info("Attempting to clean up incomplete uploads due to failure...")
+                self.abort_incomplete_multipart_uploads(bucket_name, s3_file_path, min_age_seconds=900, exact_key=True)
+            return False
+        except ClientError as error_msg:
+            code = error_msg.response["Error"]["Code"]
+            msg = error_msg.response["Error"]["Message"]
+            logger.error(f"S3 ClientError [{code}]: {msg}")
+            if cleanup_on_failure:
+                logger.info("Attempting to clean up incomplete uploads due to failure...")
+                self.abort_incomplete_multipart_uploads(bucket_name, s3_file_path, min_age_seconds=900,
+                                                            exact_key=True)
+            return False
+        except Exception as error_msg:
+            logger.error(f"Unexpected error occurred: {error_msg}")
+            return False
+
+        logger.info("S3 Upload Complete s3://%s/%s", bucket_name, s3_file_path)
+        return True
+
 
     # ----------------------------- Copy File ----------------------------------------------------------
     @aws_retryable(logger)
@@ -363,6 +583,30 @@ class AwsS3Module:
         return results
 
     # ------------------------------- Delete -------------------------------------------------
+
+    @aws_retryable(logger)
+    def delete_object(self, bucket_name: str, key: str) -> bool:
+        """
+        Delete a single S3 Object by exact key from the S3 bucket.
+
+        Parameters:
+        ----------
+            bucket_name:
+                Name of the S3 bucket
+            key:
+                Key of the object to delete
+
+        Returns:
+        -------
+            True if the deletion is successful (or object not found), False on error.
+        """
+        logger.info("Deleting object from s3://%s/%s", bucket_name, key)
+        try:
+            self.client.delete_object(Bucket=bucket_name, Key=key)
+        except ClientError as error_msg:
+            logger.error("Failed to delete s3://%s/%s: %s",bucket_name, key, error_msg)
+            return False
+        return True
 
     def _delete_batch(self, bucket_name: str, batch: list[dict]) -> int:
         """
