@@ -65,7 +65,7 @@ def get_region() -> str:
 def get_client(
         service_name: str,
         region_name: str = DEFAULT_REGION,
-        endpoint_url: str = "",
+        endpoint_url: str | None = None,
         config: Config | None = None,
         aws_access_key_id: str | None = None,
         aws_secret_access_key: str | None = None,
