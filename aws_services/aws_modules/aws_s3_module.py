@@ -698,7 +698,7 @@ class AwsS3Module:
         logger.info("Deleted %d objects under s3://%s/%s", deleted_count, bucket_name, prefix)
         return deleted_count
 
-    # ------------------------------- Delete -------------------------------------------------
+    # ------------------------------- Download -------------------------------------------------
     @aws_retryable(logger)
     def download_object_from_s3(
             self,
